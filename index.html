@@ -3519,7 +3519,11 @@ async function generateAnswer(q){
 }
 
 const ASK_API_CONFIG={
+  provider:'custom',
   endpoint:'',
+  accountId:'',
+  model:'@cf/meta/llama-3.1-8b-instruct',
+  bearerToken:'',
   headers:{},
   timeout:45000
 };
@@ -3532,13 +3536,32 @@ function getAskApiConfig(){
     if(saved)cfg={...cfg,...JSON.parse(saved)};
   }catch(e){console.warn('Failed to parse wenwen_api_config',e);}
   cfg.endpoint=String(cfg.endpoint||window.WENWEN_API_ENDPOINT||'').trim();
+  cfg.provider=String(cfg.provider||'custom').toLowerCase();
+  if(cfg.provider==='cloudflare'&&!cfg.endpoint&&cfg.accountId){
+    const model=encodeURIComponent(cfg.model||ASK_API_CONFIG.model);
+    cfg.endpoint=`https://api.cloudflare.com/client/v4/accounts/${cfg.accountId}/ai/run/${model}`;
+  }
   cfg.headers={...(ASK_API_CONFIG.headers||{}),...(cfg.headers||{})};
+  if(cfg.bearerToken&&!cfg.headers.Authorization)cfg.headers.Authorization=`Bearer ${cfg.bearerToken}`;
   return cfg;
 }
 
 function normalizeAskApiText(data){
   if(typeof data==='string')return data;
-  return data?.answer||data?.text||data?.content||data?.message?.content||data?.choices?.[0]?.message?.content||data?.choices?.[0]?.text||'';
+  return data?.answer||data?.text||data?.content||data?.result?.response||data?.result?.answer||data?.result?.text||data?.message?.content||data?.choices?.[0]?.message?.content||data?.choices?.[0]?.text||'';
+}
+
+function buildAskApiPayload(cfg,q,ctx,profile,systemPrompt){
+  if(cfg.provider==='cloudflare'){
+    return {
+      messages:[
+        {role:'system',content:systemPrompt+"\n用户命盘：\n"+ctx},
+        {role:'user',content:q}
+      ],
+      max_tokens:700
+    };
+  }
+  return {question:q,context:ctx,profile,system:systemPrompt};
 }
 
 async function generateAnswerFromApi(q,d,el){
@@ -3552,7 +3575,7 @@ async function generateAnswerFromApi(q,d,el){
     const resp=await fetch(cfg.endpoint,{
       method:cfg.method||'POST',
       headers:{'Content-Type':'application/json',...cfg.headers},
-      body:JSON.stringify({question:q,context:ctx,profile:d.input,system:systemPrompt}),
+      body:JSON.stringify(buildAskApiPayload(cfg,q,ctx,d.input,systemPrompt)),
       signal:ctrl.signal
     });
     if(!resp.ok)throw new Error('API '+resp.status);

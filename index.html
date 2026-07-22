@@ -3509,32 +3509,93 @@ async function generateAnswer(q){
     return;
   
   }
-  // —— 步骤 2：调用 AI API（流式）——
-  // typing removed
+  // —— 步骤 2：调用可配置的问问大师 API ——
+  try{
+    await generateAnswerFromApi(q,d,el);
+  }catch(e){
+    console.warn('Ask API unavailable, using local fallback:',e);
+    generateAnswerFallback(q,d,el);
+  }
+}
+
+const ASK_API_CONFIG={
+  provider:'custom',
+  endpoint:'/api/ask',
+  accountId:'',
+  model:'@cf/meta/llama-3.1-8b-instruct',
+  bearerToken:'',
+  headers:{},
+  timeout:45000
+};
+
+function getAskApiConfig(){
+  let cfg={...ASK_API_CONFIG};
+  try{
+    if(window.WENWEN_API_CONFIG)cfg={...cfg,...window.WENWEN_API_CONFIG};
+    const saved=localStorage.getItem('wenwen_api_config');
+    if(saved)cfg={...cfg,...JSON.parse(saved)};
+  }catch(e){console.warn('Failed to parse wenwen_api_config',e);}
+  cfg.endpoint=String(cfg.endpoint||window.WENWEN_API_ENDPOINT||'').trim();
+  cfg.provider=String(cfg.provider||'custom').toLowerCase();
+  if(cfg.provider==='cloudflare'&&!cfg.endpoint&&cfg.accountId){
+    const model=encodeURIComponent(cfg.model||ASK_API_CONFIG.model);
+    cfg.endpoint=`https://api.cloudflare.com/client/v4/accounts/${cfg.accountId}/ai/run/${model}`;
+  }
+  cfg.headers={...(ASK_API_CONFIG.headers||{}),...(cfg.headers||{})};
+  if(cfg.bearerToken&&!cfg.headers.Authorization)cfg.headers.Authorization=`Bearer ${cfg.bearerToken}`;
+  return cfg;
+}
+
+function normalizeAskApiText(data){
+  if(typeof data==='string')return data;
+  return data?.answer||data?.text||data?.content||data?.result?.response||data?.result?.answer||data?.result?.text||data?.message?.content||data?.choices?.[0]?.message?.content||data?.choices?.[0]?.text||'';
+}
+
+function buildAskApiPayload(cfg,q,ctx,profile,systemPrompt){
+  if(cfg.provider==='cloudflare'){
+    return {
+      messages:[
+        {role:'system',content:systemPrompt+"\n用户命盘：\n"+ctx},
+        {role:'user',content:q}
+      ],
+      max_tokens:700
+    };
+  }
+  return {question:q,context:ctx,profile,system:systemPrompt};
+}
+
+async function generateAnswerFromApi(q,d,el){
+  const cfg=getAskApiConfig();
+  if(!cfg.endpoint)throw new Error('missing Ask API endpoint');
   const ctx=buildBaziContext(d);
   const systemPrompt=`你是「问问」AI顾问。请像一位理解用户处境的朋友，结合命盘给出自然、具体、能执行的回应。先识别问题类型（事业、财富、关系、健康、选择或术语解释），如果用户一次问了多个问题，逐项回答而不是漏答。先给一句清晰结论，再说明与命盘相关的两条依据，最后给出一到三步现实行动；行动要有先后顺序、时间范围或完成标准。优先使用当前大运、流年、日主、用神和评分等已有数据，但不要重复整份命盘。专业术语只有在确实有帮助时才使用，并立即用白话解释；如果问题不需要术语，就完全不用。对“怎么办/具体怎么做”必须给可执行例子；信息不足时只追问一个最关键的问题，同时先给暂行建议。语气温和、诚实、有边界，不制造确定性，不把命理说成事实或医疗、法律、投资结论。中文回复控制在220至420字。`;
+  const ctrl=new AbortController();
+  const timer=setTimeout(()=>ctrl.abort(),Number(cfg.timeout)||45000);
   try{
-    const resp=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:600,stream:true,system:systemPrompt+"\n用户命盘：\n"+ctx,messages:[{role:'user',content:q}]})});
+    const resp=await fetch(cfg.endpoint,{
+      method:cfg.method||'POST',
+      headers:{'Content-Type':'application/json',...cfg.headers},
+      body:JSON.stringify(buildAskApiPayload(cfg,q,ctx,d.input,systemPrompt)),
+      signal:ctrl.signal
+    });
     if(!resp.ok)throw new Error('API '+resp.status);
-    const reader=resp.body.getReader();const dec=new TextDecoder();let full='';
-    
-    const div = document.createElement('div'); 
-    div.className = 'ai-body-inner'; 
-    const typing = el.querySelector('.loading-state');
-    if(typing) typing.remove();
+    const type=resp.headers.get('content-type')||'';
+    const data=type.includes('application/json')?await resp.json():await resp.text();
+    const full=normalizeAskApiText(data).trim();
+    if(!full)throw new Error('empty API response');
+
+    const div=document.createElement('div');
+    div.className='ai-body-inner';
+    const typing=el.querySelector('.loading-state');
+    if(typing)typing.remove();
+    div.innerHTML=formatStandardAnswer(full);
+    const links=buildRelatedRoutes(extractIntents(q));
+    if(links.length)div.innerHTML+=renderRouteButtons(links,'前往相关页面查看');
     el.appendChild(div);
-    const ans = div; let buf='';
-  
-    while(true){const{done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const lines=buf.split('\n');buf=lines.pop()||'';for(const ln of lines){if(!ln.startsWith('data: '))continue;const raw=ln.slice(6).trim();if(raw==='[DONE]')break;try{const js=JSON.parse(raw);if(js.type==='content_block_delta'&&js.delta?.type==='text_delta'){full+=js.delta.text;ans.innerHTML=formatStandardAnswer(full);}}catch(e){}}}
-    if(!full)throw new Error('empty');
-    // AI 回答之后，自动附加"相关页面跳转"按钮
-    const intents=extractIntents(q);
-    const links=buildRelatedRoutes(intents);
-    if(links.length){
-      ans.innerHTML+=renderRouteButtons(links,'前往相关页面查看');
-    }
     requestAnimationFrame(()=>{el.scrollIntoView({behavior:'smooth',block:'nearest'});});
-  }catch(e){generateAnswerFallback(q,d,el);}
+  }finally{
+    clearTimeout(timer);
+  }
 }
 
 // —— 渲染 KB 命中结果 ——
